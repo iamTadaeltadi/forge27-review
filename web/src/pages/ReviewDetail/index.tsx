@@ -1,0 +1,289 @@
+import React, { useEffect, useState } from 'react';
+import { useParams, Link } from 'react-router-dom';
+import { useDispatch, useSelector } from 'react-redux';
+import { AppDispatch, RootState } from '../../redux/store';
+import { fetchPRDetailsAction } from '../../redux/actions/PullRequestAction';
+import { FiGitPullRequest, FiGitCommit, FiCheck, FiX, FiMessageSquare, FiAlertCircle, FiArrowLeft, FiClock } from 'react-icons/fi';
+import type { PRFileDiff, PRComment, PRReview } from '../../api/PullRequestApi';
+import { getReviewHistory, ReviewHistoryEntry } from '../../api/CodeReviewAPi';
+
+const PullRequestDetail: React.FC = () => {
+  const { repoId, prNumber } = useParams<{ repoId: string; prNumber: string }>();
+  const dispatch = useDispatch<AppDispatch>();
+  const { currentPR, status, error } = useSelector((state: RootState) => state.pullRequests);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [reviewHistory, setReviewHistory] = useState<ReviewHistoryEntry[]>([]);
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (repoId && prNumber) {
+      dispatch(fetchPRDetailsAction({ repoId: parseInt(repoId, 10), prNumber: parseInt(prNumber, 10) }));
+    }
+  }, [repoId, prNumber, dispatch]);
+
+  useEffect(() => {
+    if (!currentPR?.id) {
+      setReviewHistory([]);
+      return;
+    }
+
+    let isActive = true;
+    setReviewLoading(true);
+    setReviewError(null);
+
+    getReviewHistory('pr', currentPR.id)
+      .then((entries) => {
+        if (isActive) {
+          setReviewHistory(entries);
+        }
+      })
+      .catch((err: any) => {
+        if (isActive) {
+          setReviewError(err?.message || 'Failed to load review workflow history.');
+        }
+      })
+      .finally(() => {
+        if (isActive) {
+          setReviewLoading(false);
+        }
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [currentPR?.id]);
+
+  if (status === 'loading') {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-4">
+        <div className="relative">
+          <div className="w-12 h-12 rounded-full border-2 border-blue-600 animate-pulse"></div>
+          <div className="absolute top-0 left-0 w-12 h-12 rounded-full border-t-2 border-blue-600 animate-spin"></div>
+        </div>
+        <p className="text-gray-500 animate-pulse">Loading pull request details...</p>
+      </div>
+    );
+  }
+
+  if (status === 'failed' || !currentPR) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <div className="max-w-md w-full bg-white p-8 rounded-xl shadow-sm border border-red-200">
+          <div className="flex items-center justify-center w-12 h-12 mx-auto bg-red-100 rounded-full">
+            <FiAlertCircle className="w-6 h-6 text-red-600" />
+          </div>
+          <h3 className="mt-4 text-lg font-medium text-center text-gray-900">Error Loading Pull Request</h3>
+          <p className="mt-2 text-sm text-center text-gray-500">{error}</p>
+          <button
+            onClick={() => dispatch(fetchPRDetailsAction({ repoId: parseInt(repoId!, 10), prNumber: parseInt(prNumber!, 10) }))}
+            className="mt-4 w-full px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-lg hover:bg-red-700"
+          >
+            Try Again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-8">
+      <div className="mb-8">
+        <div className="flex items-center gap-2 mb-4">
+          <Link to={`/repos/${repoId}/pulls`} className="inline-flex items-center text-gray-600 hover:text-gray-900">
+            <FiArrowLeft className="mr-2" />
+            Back to Pull Requests
+          </Link>
+        </div>
+        <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <FiGitPullRequest className={`w-5 h-5 ${currentPR.state === 'open' ? 'text-green-600' : 'text-red-600'}`} />
+              <h1 className="text-2xl font-semibold text-gray-900">
+                {currentPR.title} <span className="text-gray-500">#{currentPR.number}</span>
+              </h1>
+            </div>
+            <div className="mt-2 flex items-center gap-4 text-sm text-gray-500">
+              <div className="flex items-center gap-1">
+                <img src={currentPR.user.avatar_url} alt={currentPR.user.login} className="w-5 h-5 rounded-full" />
+                <span>{currentPR.user.login}</span>
+              </div>
+              <span>Created {new Date(currentPR.created_at).toLocaleDateString()}</span>
+            </div>
+          </div>
+          <div className="rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm text-blue-900 max-w-sm">
+            Internal review actions are generated by the backend review pipeline. This page shows workflow status and links instead of a synthetic approve action.
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6 mb-8">
+        <div className="prose max-w-none">{currentPR.body || 'No pull request description was provided.'}</div>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden mb-8">
+        <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+          <div>
+            <h2 className="text-lg font-medium text-gray-900">Internal Review Workflow</h2>
+            <p className="text-sm text-gray-500 mt-1">These are the review runs recorded by the backend for this pull request.</p>
+          </div>
+        </div>
+        {reviewLoading ? (
+          <div className="px-6 py-8 text-sm text-gray-500">Loading internal review history...</div>
+        ) : reviewError ? (
+          <div className="px-6 py-8 text-sm text-red-600">{reviewError}</div>
+        ) : reviewHistory.length === 0 ? (
+          <div className="px-6 py-8 text-sm text-gray-500">No internal review runs have been recorded for this pull request yet.</div>
+        ) : (
+          <div className="divide-y divide-gray-200">
+            {reviewHistory.map((entry) => (
+              <div key={entry.id} className="px-6 py-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-3">
+                    <ReviewStatusBadge status={entry.status} />
+                    <span className="text-sm text-gray-500">Review #{entry.id}</span>
+                  </div>
+                  <div className="mt-2 text-sm text-gray-600 flex flex-wrap gap-4">
+                    <span>Started {new Date(entry.createdAt).toLocaleString()}</span>
+                    <span>Updated {new Date(entry.updatedAt).toLocaleString()}</span>
+                    <span>{entry.threadCount} thread{entry.threadCount === 1 ? '' : 's'}</span>
+                  </div>
+                  {entry.errorMessage && <p className="mt-2 text-sm text-red-600">{entry.errorMessage}</p>}
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-xs uppercase tracking-wide text-gray-500">
+                    {entry.hasReviewData ? 'Findings ready' : 'Awaiting analysis'}
+                  </span>
+                  <Link to={`/commit-review/${entry.id}`} className="inline-flex items-center px-3 py-2 text-sm font-medium text-blue-700 bg-blue-50 rounded-lg hover:bg-blue-100">
+                    Open review
+                  </Link>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden mb-8">
+        <div className="px-6 py-4 border-b border-gray-200">
+          <h2 className="text-lg font-medium text-gray-900">Files Changed</h2>
+        </div>
+        <div className="divide-y divide-gray-200">
+          {currentPR.files.length === 0 ? (
+            <div className="p-6 text-sm text-gray-500">File diffs are not persisted in the current backend response for this pull request yet.</div>
+          ) : currentPR.files.map((file: PRFileDiff) => (
+            <div key={file.id} className="p-4 hover:bg-gray-50 transition-colors duration-150">
+              <button onClick={() => setSelectedFile(selectedFile === file.filename ? null : file.filename)} className="w-full text-left">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <FiGitCommit className="text-gray-400" />
+                    <span className="font-mono text-sm text-gray-900">{file.filename}</span>
+                  </div>
+                  <div className="flex items-center gap-4 text-sm">
+                    <span className="text-green-600">+{file.additions}</span>
+                    <span className="text-red-600">-{file.deletions}</span>
+                  </div>
+                </div>
+                {selectedFile === file.filename && file.patch && (
+                  <pre className="mt-4 p-4 bg-gray-50 rounded-lg overflow-x-auto text-sm">{file.patch}</pre>
+                )}
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden mb-8">
+        <div className="px-6 py-4 border-b border-gray-200">
+          <h2 className="text-lg font-medium text-gray-900">GitHub Reviews</h2>
+        </div>
+        <div className="divide-y divide-gray-200">
+          {currentPR.reviews.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12">
+              <FiMessageSquare className="w-8 h-8 text-gray-400 mb-2" />
+              <p className="text-gray-500">No GitHub reviews are attached to this response.</p>
+            </div>
+          ) : (
+            currentPR.reviews.map((review: PRReview) => (
+              <div key={review.id} className="p-6">
+                <div className="flex items-start gap-4">
+                  <img src={review.user.avatar_url} alt={review.user.login} className="w-10 h-10 rounded-full" />
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium text-gray-900">{review.user.login}</span>
+                      <GitHubReviewStateBadge state={review.state} />
+                      <span className="text-sm text-gray-500">{new Date(review.submitted_at).toLocaleDateString()}</span>
+                    </div>
+                    <p className="mt-2 text-gray-700">{review.body}</p>
+                  </div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+        <div className="px-6 py-4 border-b border-gray-200">
+          <h2 className="text-lg font-medium text-gray-900">Comments</h2>
+        </div>
+        <div className="divide-y divide-gray-200">
+          {currentPR.comments.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12">
+              <FiMessageSquare className="w-8 h-8 text-gray-400 mb-2" />
+              <p className="text-gray-500">No comments are attached to this response.</p>
+            </div>
+          ) : (
+            currentPR.comments.map((comment: PRComment) => (
+              <div key={comment.id} className="p-6">
+                <div className="flex items-start gap-4">
+                  <img src={comment.user.avatar_url} alt={comment.user.login} className="w-10 h-10 rounded-full" />
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium text-gray-900">{comment.user.login}</span>
+                      <span className="text-sm text-gray-500">{new Date(comment.created_at).toLocaleDateString()}</span>
+                    </div>
+                    <p className="mt-2 text-gray-700">{comment.body}</p>
+                    {comment.path && (
+                      <div className="mt-2 text-sm text-gray-500">
+                        <span className="font-mono">{comment.path}</span>
+                        {comment.line && <span className="ml-2">Line {comment.line}</span>}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const GitHubReviewStateBadge = ({ state }: { state: string }) => {
+  switch (state) {
+    case 'APPROVED':
+      return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-50 text-green-700"><FiCheck className="w-3 h-3 mr-1" />Approved</span>;
+    case 'CHANGES_REQUESTED':
+      return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-50 text-red-700"><FiX className="w-3 h-3 mr-1" />Changes requested</span>;
+    default:
+      return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700"><FiMessageSquare className="w-3 h-3 mr-1" />Commented</span>;
+  }
+};
+
+const ReviewStatusBadge = ({ status }: { status: string }) => {
+  switch (status) {
+    case 'completed':
+      return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-50 text-green-700"><FiCheck className="w-3 h-3 mr-1" />Completed</span>;
+    case 'failed':
+      return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-50 text-red-700"><FiX className="w-3 h-3 mr-1" />Failed</span>;
+    case 'in_progress':
+    case 'processing':
+      return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-50 text-blue-700"><FiClock className="w-3 h-3 mr-1" />In progress</span>;
+    default:
+      return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-50 text-amber-700"><FiAlertCircle className="w-3 h-3 mr-1" />Pending</span>;
+  }
+};
+
+export default PullRequestDetail;

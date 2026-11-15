@@ -1,0 +1,26 @@
+# Coverage scope for `bash scripts/coverage.sh` and the CI threshold step:
+# the Django API package (services/api/core). The agent, graph and experiment
+# code is exercised by tests/ but not counted here.
+[run]
+source =
+    services/api/core
+branch = False
+omit =
+    */migrations/*
+    */__pycache__/*
+    */tests/*
+    */test_*.py
+    services/api/manage.py
+    services/api/core/tests.py
+    services/api/django_backend/*
+
+[report]
+show_missing = True
+skip_empty = True
+fail_under = 80
+exclude_also =
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    def __repr__
+    \.\.\.

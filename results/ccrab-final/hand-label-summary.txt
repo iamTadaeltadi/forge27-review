@@ -1,0 +1,44 @@
+Hand-label summary: 50 hits from c-CRAB run 4 (results/ccrab-final/hand-label-hits.csv)
+Human labels: labels-human.csv (Anonymous Author, condition visible). LLM labels: labels-llm.csv (claude-fable-5-1, 1 = explains, 0 = not).
+Generated 2026-11-06. Labelling by one author only; no second human labeller.
+
+Rows with a human label: 50 of 50. Missing: none.
+Rechecked on 2026-11-14 (after the agreement figures below were computed): rows 2 and 34 were labelled 'explains' with ai_point_valid = no. Row 2 was set to ai_point_valid = yes; row 34 was kept at ai_point_valid = no, with the note 'redundant, not wrong.' The 'explains' labels and labels-human-raw.csv are unchanged, so the agreement and rate figures below do not change.
+Rows with a label but no ai_point_valid: none.
+
+Human label counts: explains 6, partial 2, wrong-reason 42
+ai_point_valid counts: no 39, yes 11
+
+(1) Agreement, human 'explains' vs LLM 1  (n = 50)
+  agreement 96.0%  Cohen's kappa 0.834
+                 LLM 1   LLM 0
+  human yes          6       0
+  human no           2      42
+  disagreements: 30, 38
+
+(1b) Agreement, human 'explains'+'partial' vs LLM 1  (n = 50)
+  agreement 100.0%  Cohen's kappa 1.000
+                 LLM 1   LLM 0
+  human yes          8       0
+  human no           0      42
+  disagreements: none
+
+(2) 'explains' rate, Wilson 95%
+  group   k/n     rate    95% interval
+  all     6/50    12.0%  [  5.6,  23.8]
+  A       1/10    10.0%  [  1.8,  40.4]
+  B       1/10    10.0%  [  1.8,  40.4]
+  C       2/10    20.0%  [  5.7,  51.0]
+  Cx      2/10    20.0%  [  5.7,  51.0]
+  D       0/10     0.0%  [ -0.0,  27.8]
+
+(3) 'explains'+'partial' rate, Wilson 95%
+  group   k/n     rate    95% interval
+  all     8/50    16.0%  [  8.3,  28.5]
+  A       1/10    10.0%  [  1.8,  40.4]
+  B       3/10    30.0%  [ 10.8,  60.3]
+  C       2/10    20.0%  [  5.7,  51.0]
+  Cx      2/10    20.0%  [  5.7,  51.0]
+  D       0/10     0.0%  [ -0.0,  27.8]
+
+Note: condition A has no cross-file context (diff only); B/C/Cx/D are the context conditions. Per-condition n is 10, so the intervals are wide.

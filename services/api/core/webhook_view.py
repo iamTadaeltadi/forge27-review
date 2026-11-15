@@ -1,0 +1,97 @@
+from django.http import HttpResponse
+
+from .tasks.review_tasks import process_webhook_event
+from .models import (
+    Repository as DBRepository,
+    WebhookEventLog
+)
+import hashlib
+import hmac
+from django.conf import settings
+from django.views.decorators.csrf import csrf_exempt
+from django.utils import timezone
+import logging
+from django.views.decorators.http import require_POST
+import json
+
+logger = logging.getLogger(__name__)
+
+
+@csrf_exempt
+@require_POST
+async def github_webhook(request):
+    """Handle GitHub webhook events"""
+    signature = request.headers.get('X-Hub-Signature-256')
+    event_type = request.headers.get('X-GitHub-Event')
+    delivery_id = request.headers.get('X-GitHub-Delivery')
+
+    if not all([signature, event_type, delivery_id]):
+        logger.warning("Webhook request missing required headers (Signature, Event, Delivery ID).")
+        return HttpResponse('Missing required headers', status=400)
+
+    try:
+        event_data = json.loads(request.body.decode('utf-8'))
+    except json.JSONDecodeError as e:
+        logger.warning(f"Invalid JSON payload for webhook event {delivery_id}: {str(e)}")
+        return HttpResponse('Invalid JSON payload', status=400)
+
+    repo_full_name = event_data.get('repository', {}).get('full_name')
+
+    repository = None
+    if repo_full_name:
+        try:
+            repository = await DBRepository.objects.aget(repo_name=repo_full_name)
+        except DBRepository.DoesNotExist:
+            logger.warning(f"Repository {repo_full_name} not found in the database.")
+
+    try:
+        webhook_secret = repository.webhook_secret if repository else None
+        if not webhook_secret:
+            webhook_secret = settings.GITHUB_WEBHOOK_SECRET
+
+        expected_signature = hmac.new(
+            webhook_secret.encode('utf-8'),
+            request.body,
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(f"sha256={expected_signature}", signature):
+            logger.warning(f"Invalid webhook signature for event {delivery_id}.")
+            return HttpResponse('Invalid signature', status=401)
+    except Exception as e:
+        logger.error(f"Error during webhook signature verification for event {delivery_id}: {str(e)}")
+        return HttpResponse('Error verifying signature', status=500)
+
+    existing_entry = await WebhookEventLog.objects.filter(event_id=delivery_id).afirst()
+    if existing_entry is not None and existing_entry.status == 'processed':
+        logger.info(f"Webhook event {delivery_id} ({event_type}) already processed, skipping.")
+        return HttpResponse('Event already processed', status=200)
+
+    log_entry, created = await WebhookEventLog.objects.aupdate_or_create(
+        event_id=delivery_id,
+        defaults={
+            'repository': repository,
+            'event_type': event_type,
+            'payload': event_data,
+            'headers': dict(request.headers),
+            'status': 'received',
+            'error_message': None,
+            'processed_at': None,
+        }
+    )
+
+    try:
+        process_webhook_event.delay(event_type, event_data)
+
+        log_entry.status = 'processed'
+        log_entry.processed_at = timezone.now()
+        await log_entry.asave(update_fields=['status', 'processed_at'])
+        logger.info(f"Webhook event {delivery_id} ({event_type}) successfully enqueued for processing.")
+        return HttpResponse('Webhook processed and enqueued', status=202)
+
+    except Exception as e:
+        logger.error(f"Error processing webhook event {delivery_id} after verification: {str(e)}", exc_info=True)
+        log_entry.status = 'failed'
+        log_entry.error_message = f"Internal processing error: {str(e)}"
+        await log_entry.asave()
+        return HttpResponse('Error processing webhook', status=500)

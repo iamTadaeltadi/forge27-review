@@ -1,0 +1,62 @@
+file:                 results/v2-tag-deepseek/structure-judged-strict.jsonl
+model:                deepseek/deepseek-v3.2
+encoding:             tag
+metric:               mechanism
+arms:                 1-diff, 2-evidence, 3-topology, 4-typed, 5-attributed, 6-corrupted, 7-random, 8-header
+tasks compared:       225
+duplicates dropped:   0  (first occurrence kept)
+incomplete dropped:   1  (tasks missing from at least one arm)
+bootstrap:            6000 trials, seed 0, percentile 2.5/97.5
+
+arm               n  n_metricmean_mechanism  findings  distract  parse_fail  prompt_chars    cost_usd
+-----------------------------------------------------------------------------------------------------
+1-diff          225       220         0.800      1.20      0.26           4          1188     0.00017
+2-evidence      225       218         0.789      1.76      0.49           7          4313     0.00041
+3-topology      225       214         0.869      1.63      0.39          10          4281     0.00032
+4-typed         225       216         0.917      1.57      0.38           8          4290     0.00026
+5-attributed    225       218         0.922      1.52      0.29           7          4313     0.00024
+6-corrupted     225       216         0.884      1.63      0.35           9          4313     0.00021
+7-random        225       217         0.825      1.35      0.38           5          3390     0.00029
+8-header        225       218         0.780      1.47      0.49           5          1495     0.00016
+
+comparisons (8 in the Holm family)
+
+primary: 3-topology minus 2-evidence  (metric=mechanism, n=209, skipped=16)
+  difference   0.081   repo-clustered 95% CI [  0.031,   0.131]   task-clustered 95% CI [  0.029,   0.134]
+  repo-clustered: interval excludes zero; task-clustered: interval excludes zero
+  McNemar b=25 (a right, b wrong)  c=8 (a wrong, b right)  exact p=0.0046  Holm-adjusted p=0.0228
+
+secondary: 6-corrupted minus 2-evidence  (metric=mechanism, n=213, skipped=12)
+  difference   0.089   repo-clustered 95% CI [  0.049,   0.132]   task-clustered 95% CI [  0.038,   0.141]
+  repo-clustered: interval excludes zero; task-clustered: interval excludes zero
+  McNemar b=26 (a right, b wrong)  c=7 (a wrong, b right)  exact p=0.0013  Holm-adjusted p=0.0079
+
+extra 1: 5-attributed minus 2-evidence  (metric=mechanism, n=213, skipped=12)
+  difference   0.146   repo-clustered 95% CI [  0.088,   0.205]   task-clustered 95% CI [  0.089,   0.202]
+  repo-clustered: interval excludes zero; task-clustered: interval excludes zero
+  McNemar b=36 (a right, b wrong)  c=5 (a wrong, b right)  exact p=7.84e-07  Holm-adjusted p=6.27e-06
+
+extra 2: 4-typed minus 2-evidence  (metric=mechanism, n=212, skipped=13)
+  difference   0.123   repo-clustered 95% CI [  0.058,   0.191]   task-clustered 95% CI [  0.066,   0.179]
+  repo-clustered: interval excludes zero; task-clustered: interval excludes zero
+  McNemar b=34 (a right, b wrong)  c=8 (a wrong, b right)  exact p=6.88e-05  Holm-adjusted p=4.81e-04
+
+extra 3: 2-evidence minus 8-header  (metric=mechanism, n=211, skipped=14)
+  difference   0.000   repo-clustered 95% CI [ -0.062,   0.060]   task-clustered 95% CI [ -0.066,   0.066]
+  repo-clustered: interval spans zero; task-clustered: interval spans zero
+  McNemar b=25 (a right, b wrong)  c=25 (a wrong, b right)  exact p=1.0000  Holm-adjusted p=1.0000
+
+extra 4: 8-header minus 1-diff  (metric=mechanism, n=214, skipped=11)
+  difference  -0.028   repo-clustered 95% CI [ -0.089,   0.035]   task-clustered 95% CI [ -0.089,   0.033]
+  repo-clustered: interval spans zero; task-clustered: interval spans zero
+  McNemar b=19 (a right, b wrong)  c=25 (a wrong, b right)  exact p=0.4514  Holm-adjusted p=1.0000
+
+extra 5: 7-random minus 1-diff  (metric=mechanism, n=213, skipped=12)
+  difference   0.023   repo-clustered 95% CI [ -0.037,   0.086]   task-clustered 95% CI [ -0.033,   0.080]
+  repo-clustered: interval spans zero; task-clustered: interval spans zero
+  McNemar b=22 (a right, b wrong)  c=17 (a wrong, b right)  exact p=0.5224  Holm-adjusted p=1.0000
+
+extra 6: 2-evidence minus 7-random  (metric=mechanism, n=210, skipped=15)
+  difference  -0.043   repo-clustered 95% CI [ -0.103,   0.021]   task-clustered 95% CI [ -0.110,   0.024]
+  repo-clustered: interval spans zero; task-clustered: interval spans zero
+  McNemar b=22 (a right, b wrong)  c=31 (a wrong, b right)  exact p=0.2717  Holm-adjusted p=1.0000

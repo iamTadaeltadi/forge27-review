@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""Run the experiment: every condition against the same tasks, one budget.
+
+    python experiments/run.py --limit 3 --conditions A,B,D
+    python experiments/run.py --limit 20 --model qwen/qwen-2.5-coder-32b-instruct
+
+Results stream to runs/<name>/outcomes.jsonl as they complete, so a run that
+dies at task 200 resumes rather than restarts, and every raw model response is
+kept for inspection.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+
+# Running this file as a script puts experiments/ first on sys.path, where
+# config.py then shadows services/agents/config.py and breaks the agent
+# runtime's own "from config import Config". Drop it: every import here is
+# either absolute from the repository root or from a service directory.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.getcwd()) != _HERE]
+_ROOT = os.path.dirname(_HERE)
+for _extra in (_ROOT, os.path.join(_ROOT, "services", "agents"), os.path.join(_ROOT, "services", "graph")):
+    if _extra not in sys.path:
+        sys.path.insert(0, _extra)
+from dataclasses import asdict
+from pathlib import Path
+
+from experiments.benchmark import load_ccrab, load_crossfile, oracle_targets, summarise
+from experiments.config import (
+    CONDITION_GRAPH,
+    CONDITION_NONE,
+    CONDITION_ORACLE,
+    CONDITION_WHOLE_FILE,
+    MODELS,
+    RunMatrix,
+)
+from experiments.llm import Usage, client_from_env, load_env
+from experiments.matcher import DEFAULT_LINE_TOLERANCE, match_review
+from experiments.metrics import compare, summarise_condition, table
+from experiments.repo import RepoError, evict, graph_for
+from experiments.sparse import collect_sources, graph_from_sources, repo_tree
+from experiments.review import review_once
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA = ROOT / "data" / "stage3_testgen_verified.jsonl"
+DEFAULT_ARCHIVE = ROOT / "data" / "testgen_combined.zip"
+
+NEEDS_GRAPH = {"B", "C", "D", "G"}
+# Condition E of paper/PREREG-E.md, recorded as "CIS" because "E" names the whole-file arm.
+# Its context is precomputed by experiments/cis_context.py and loaded with --external-context.
+CONDITION_CIS = "CIS"
+# CxE, its size-matched random control (second amendment), written by experiments/cxe_context.py.
+# Condition names are upper-cased on the command line, so it is recorded as "CXE".
+CONDITION_CXE = "CXE"
+EXTERNAL_CONDITIONS = (CONDITION_CIS, CONDITION_CXE)
+EXTERNAL_CONTEXT = {}
+GRAPH_VERSION = "-v2"
+ENTITY_TYPES = ("function", "class")
+
+
+def graph_cache_get(task, graph_cache, token, sparse, hops=1, max_files=60):
+    """One graph per task, cached, built sparsely when the link is too slow."""
+    import pickle
+
+    cache = Path(graph_cache)
+    cache.mkdir(parents=True, exist_ok=True)
+    key = f"{task.repo.replace('/', '__')}@{task.review_commit[:12]}"
+    if sparse:
+        key += f"-sparse-h{hops}"
+    # Graphs built by the repaired builder carry file sources and resolved
+    # call edges; the earlier pickles stay under their old names for audit.
+    key += GRAPH_VERSION
+    cached = cache / f"{key}.pkl"
+    if cached.is_file():
+        with cached.open("rb") as handle:
+            return pickle.load(handle), None
+
+    if sparse:
+        from experiments.llm import load_env as _load_env
+        token = token or _load_env().get("GITHUB_TOKEN", "")
+        known = repo_tree(task.repo, task.review_commit, token=token, cache_dir=cache)
+        sources = collect_sources(task.repo, task.review_commit, task.diff, token=token,
+                                  max_files=max_files, import_hops=hops, known_paths=known)
+        if not sources:
+            raise RepoError(f"{task.repo}@{task.review_commit[:8]}: no source files fetched")
+        graph = graph_from_sources(sources)
+        info = len(sources)
+    else:
+        graph, meta = graph_for(task.repo, task.review_commit, cache_dir=graph_cache, token=token)
+        info = meta.files
+    with cached.open("wb") as handle:
+        pickle.dump(graph, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    return graph, info
+
+
+MODEL_HIDDEN_FIELDS = ("condition", "budget")
+
+
+def split_payload(raw: str):
+    """(text the model sees, fields kept for the log).
+
+    The condition letter and the budget accounting are bookkeeping; the model
+    is shown the seeds and the retrieved code only. Both halves are recorded.
+    """
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw, {}
+    if not isinstance(payload, dict):
+        return raw, {}
+    meta = {k: payload.pop(k) for k in MODEL_HIDDEN_FIELDS if k in payload}
+    return json.dumps(payload), meta
+
+
+def render_context(payload: dict) -> str:
+    """The retrieved entities as plain code blocks, one header line each.
+
+    The same function renders every condition, so the model text differs
+    between conditions only in which entities were selected. The JSON
+    envelope (seeds, budget accounting, condition) stays in the log.
+    """
+    seeds = payload.get("seeds") or []
+    lines = []
+    if seeds:
+        lines.append("Entities overlapping the diff: " + ", ".join(
+            f"{s.get('relative_path')}::{s.get('name')}" for s in seeds if s.get("name") != "unknown"))
+        lines.append("")
+    lines.append("Related code from the repository:")
+    for entry in payload.get("neighbors") or []:
+        lines += ["", f"### {entry.get('relative_path')} :: {entry.get('name')} ({entry.get('type')})",
+                  "```", (entry.get("source") or "").rstrip("\n"), "```"]
+    return "\n".join(lines)
+
+
+def build_context(task, condition, matrix, graph_cache, token, max_depth, sparse=True,
+                  hops=1, max_files=60, prefer_cross_file=False, strip_seed=False,
+                  plain_context=False, exclude_tests=False, callers_first=False,
+                  drop_class_seeds=False):
+    """Return (context text for the model, graph info, retrieval log fields)."""
+    if condition in EXTERNAL_CONDITIONS:
+        if task.task_id not in EXTERNAL_CONTEXT:
+            raise RepoError(f"{task.task_id}: no precomputed {condition} context (--external-context)")
+        entry = EXTERNAL_CONTEXT[task.task_id]
+        return entry.get("context_text") or "", None, dict(entry.get("retrieval") or {})
+    if condition == CONDITION_NONE:
+        return "", None, {}
+
+    if condition == CONDITION_WHOLE_FILE:
+        # The reference arm for what practitioners actually do: hand over the
+        # whole of every file the diff touches, unbudgeted. It is reported
+        # separately from the matched arms precisely because it is not budgeted;
+        # returning nothing here would have made it a silent duplicate of A.
+        sources = collect_sources(
+            task.repo, task.review_commit, task.diff, token=token, import_hops=0
+        )
+        if not sources:
+            raise RepoError(f"{task.repo}@{task.review_commit[:8]}: no source files fetched")
+        rendered = "\n\n".join(
+            f"### {path}\n{text}" for path, text in sorted(sources.items())
+        )
+        return rendered, len(sources), {}
+
+    from Utils.ToolOrganizer import build_tools
+
+    graph = None
+    info = None
+    if condition in NEEDS_GRAPH or condition == CONDITION_ORACLE:
+        graph, info = graph_cache_get(task, graph_cache, token, sparse, hops, max_files)
+
+    tools = build_tools(
+        graph,
+        str(graph_cache),
+        condition=condition,
+        max_depth=max_depth,
+        max_neighbors=matrix.candidate_cap,
+        budget_tokens=matrix.budget_tokens,
+        seed=matrix.seeds[0],
+        oracle_targets=oracle_targets(task) if condition == CONDITION_ORACLE else None,
+        prefer_cross_file=prefer_cross_file,
+        strip_seed=strip_seed,
+        entity_types=ENTITY_TYPES,
+        max_entity_lines=matrix.entity_lines,
+        exclude_tests=exclude_tests,
+        callers_first=callers_first,
+    )
+    if not tools:
+        return "", info, {}
+
+    # The same seeds for every condition, chosen from the diff and never from
+    # the ground truth: an earlier version seeded from the function covering
+    # the defect line, which no reviewer could know.
+    seeds = seed_queries(task, graph, drop_class_seeds=drop_class_seeds)
+    if not seeds:
+        return "", info, {"seeds": []}
+    raw = tools[0].invoke({"node": "\n".join(seeds)})
+    text, meta = split_payload(raw)
+    if plain_context:
+        payload = json.loads(raw)
+        text = render_context(payload)
+        meta["delivered_ids"] = [e.get("id") for e in payload.get("neighbors") or []]
+        meta["delivered_seeds"] = [s.get("id") for s in payload.get("seeds") or []]
+    meta["seed_queries"] = seeds
+    return text, info, meta
+
+
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.M)
+DIFF_FILE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.M)
+
+
+def changed_ranges(diff: str) -> dict:
+    """{path: [(first, last)]} of new-file line ranges the diff's hunks cover."""
+    out = {}
+    for block in re.split(r"(?=^diff --git )", diff or "", flags=re.M):
+        header = DIFF_FILE.match(block)
+        if not header:
+            continue
+        path = header.group(2)
+        if path == "/dev/null":
+            continue
+        for start, count in HUNK.findall(block):
+            start = int(start)
+            count = int(count) if count else 1
+            out.setdefault(path, []).append((start, max(start, start + count - 1)))
+    return out
+
+
+def seed_queries(task, graph, drop_class_seeds: bool = False) -> list:
+    """Every function or class in the graph whose span overlaps a changed hunk,
+    in diff order; a changed file with no such entity contributes its file node.
+    Does not read task.defects."""
+    ranges = changed_ranges(task.diff)
+    if graph is None:
+        return list(ranges)
+    seeds = []
+    for path, spans in ranges.items():
+        hits = []
+        for node_id, data in graph.nodes(data=True):
+            if data.get("relative_path") != path or data.get("type") not in ENTITY_TYPES:
+                continue
+            span = data.get("line_range") or []
+            try:
+                lo, hi = int(span[0]), int(span[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if any(lo <= last and hi >= first for first, last in spans):
+                hits.append((lo, hi - lo, f"{path}::{data.get('type')}::{data.get('name')}"))
+        if hits:
+            # Innermost entities first at each position: a method before its class.
+            # A class whose own method is already a seed is not seeded as well:
+            # the method says where the change is, the class only repeats it.
+            if drop_class_seeds:
+                functions = [(lo, lo + ln) for lo, ln, q in hits if "::function::" in q]
+                hits = [(lo, ln, q) for lo, ln, q in hits
+                        if "::class::" not in q or not any(lo <= flo and fhi <= lo + ln for flo, fhi in functions)]
+            seeds.extend(q for _, _, q in sorted(hits))
+        elif graph.has_node(path):
+            seeds.append(path)
+    return list(dict.fromkeys(seeds))
+
+
+def already_done(path):
+    seen = set()
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            seen.add((row.get("task_id"), row.get("condition")))
+    return seen
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", default=str(DEFAULT_DATA))
+    parser.add_argument("--archive", default=str(DEFAULT_ARCHIVE))
+    parser.add_argument("--name", default="pilot")
+    parser.add_argument("--conditions", default="A,B,D,G")
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--limit", type=int, default=3)
+    parser.add_argument("--depth", type=int, default=2)
+    parser.add_argument("--budget", type=int, default=None)
+    parser.add_argument("--tolerance", type=int, default=DEFAULT_LINE_TOLERANCE)
+    parser.add_argument("--graph-cache", default=str(ROOT / ".repo-cache"))
+    parser.add_argument("--max-diff-chars", type=int, default=40000)
+    parser.add_argument("--crossfile", default=None,
+                        help="run the generated cross-file benchmark instead, "
+                             "where the defect is never in the diff")
+    parser.add_argument("--prefer-cross-file", action="store_true",
+                        help="rank neighbours in other files ahead of the defect's own "
+                             "file before the budget applies; without it a file node is a "
+                             "hub and the budget fills with same-file code")
+    parser.add_argument("--strip-seed", action="store_true",
+                        help="kept for the recorded control command; the seed is now always "
+                             "stripped in every condition, so the flag changes nothing")
+    parser.add_argument("--hops", type=int, default=1,
+                        help="import hops when building the graph; the cross-file "
+                             "benchmark needs the wider neighbourhood its defects live in")
+    parser.add_argument("--plain-context", action="store_true",
+                        help="render retrieved entities as plain code blocks with a header line "
+                             "(path, name) instead of the JSON envelope; same renderer for every condition")
+    parser.add_argument("--exclude-tests", action="store_true",
+                        help="graph walk (and the random type-mix reference walk) skips test files")
+    parser.add_argument("--callers-first", action="store_true",
+                        help="graph walk ranks direct callers of the seeds first, then callees, then deeper")
+    parser.add_argument("--drop-class-seeds", action="store_true",
+                        help="a class whose method is already a seed is not seeded as well")
+    parser.add_argument("--external-context", default=None,
+                        help="JSON {task_id: {context_text, retrieval}} for condition CIS or CXE "
+                             "(paper/PREREG-E.md), written by experiments/cis_context.py or "
+                             "experiments/cxe_context.py")
+    parser.add_argument("--full-repo", action="store_true",
+                        help="download whole repositories instead of the diff's files "
+                             "and their imports; needs a fast connection")
+    args = parser.parse_args()
+
+    matrix = RunMatrix()
+    if args.budget:
+        matrix = RunMatrix(budget_tokens=args.budget)
+    model = args.model or MODELS["secondary"].name
+    conditions = [c.strip().upper() for c in args.conditions.split(",") if c.strip()]
+    if args.external_context:
+        EXTERNAL_CONTEXT.update(json.loads(Path(args.external_context).read_text()))
+
+    env = load_env()
+    client = client_from_env(env)
+    token = env.get("GITHUB_TOKEN", "")
+
+    if args.crossfile:
+        tasks = load_crossfile(args.crossfile)
+    else:
+        tasks = load_ccrab(
+            args.data,
+            testgen_archive=args.archive,
+            confirmed_only=True,
+            supported_source_only=True,
+        )
+    tasks = [t for t in tasks if len(t.diff) <= args.max_diff_chars]
+    tasks = sorted(tasks, key=lambda t: t.task_id)[: args.limit]
+    print(f"benchmark : {json.dumps(summarise(tasks))}")
+    print(f"model     : {model}")
+    print(f"conditions: {conditions}   budget={matrix.budget_tokens} depth={args.depth}")
+    print(f"graph mode: {'full repository' if args.full_repo else 'sparse (diff files + 1 import hop)'}")
+
+    outdir = ROOT / "runs" / args.name
+    outdir.mkdir(parents=True, exist_ok=True)
+    outcomes_path = outdir / "outcomes.jsonl"
+    raw_path = outdir / "raw.jsonl"
+    done = already_done(outcomes_path)
+    if done:
+        print(f"resuming  : {len(done)} task/condition pairs already recorded")
+
+    all_outcomes = []
+    usage_by_condition = {c: Usage() for c in conditions}
+    fp_by_condition = {c: 0 for c in conditions}
+    started = time.time()
+
+    for index, task in enumerate(tasks, 1):
+        for condition in conditions:
+            if (task.task_id, condition) in done:
+                continue
+            t0 = time.time()
+            try:
+                context, info, retrieval = build_context(
+                    task, condition, matrix, args.graph_cache, token, args.depth,
+                    sparse=not args.full_repo,
+                    hops=args.hops, max_files=120 if args.crossfile else 60,
+                    prefer_cross_file=args.prefer_cross_file,
+                    strip_seed=args.strip_seed,
+                    plain_context=args.plain_context,
+                    exclude_tests=args.exclude_tests,
+                    callers_first=args.callers_first,
+                    drop_class_seeds=args.drop_class_seeds,
+                )
+            except RepoError as error:
+                print(f"  [{index}/{len(tasks)}] {task.task_id} {condition}: SKIP {error}")
+                continue
+
+            result = review_once(client, model, task, condition, context)
+            if result.error:
+                print(f"  [{index}/{len(tasks)}] {task.task_id} {condition}: ERROR {result.error}")
+                continue
+
+            report = match_review(
+                task.task_id, condition, task.defects, result.findings, args.tolerance
+            )
+            all_outcomes.extend(report.outcomes)
+            usage_by_condition[condition].add(result.usage)
+            fp_by_condition[condition] += len(report.false_positives)
+
+            with outcomes_path.open("a") as handle:
+                for outcome in report.outcomes:
+                    handle.write(json.dumps(asdict(outcome)) + "\n")
+            with raw_path.open("a") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "task_id": task.task_id,
+                            "condition": condition,
+                            "model": model,
+                            "context_chars": len(context),
+                            "context_text": context if args.plain_context else None,
+                            "retrieval": retrieval,
+                            "findings": [asdict(f) for f in result.findings],
+                            "parse_failed": result.parse_failed,
+                            "usage": result.usage.as_dict(),
+                            "raw_text": result.raw_text[:8000],
+                        }
+                    )
+                    + "\n"
+                )
+
+            print(
+                f"  [{index}/{len(tasks)}] {task.task_id[:40]:<40} {condition} "
+                f"ctx={len(context):>6} found={len(result.findings):>2} "
+                f"hit={report.hits}/{len(report.outcomes)} "
+                f"${result.usage.cost_usd:.5f} {time.time()-t0:.1f}s"
+            )
+        evict(args.graph_cache)
+
+    if not all_outcomes:
+        print("\nno new results")
+        return 0
+
+    print(f"\ntotal wall time: {time.time()-started:.0f}s")
+    summaries = [
+        summarise_condition(
+            c,
+            all_outcomes,
+            false_positives=fp_by_condition[c],
+            usage=usage_by_condition[c].as_dict() | {"cost_usd": usage_by_condition[c].cost_usd},
+            bootstrap=400,
+        )
+        for c in conditions
+    ]
+    print()
+    print(table(summaries))
+
+    if CONDITION_NONE in conditions:
+        print()
+        for condition in conditions:
+            if condition != CONDITION_NONE:
+                print("  " + compare(all_outcomes, condition, CONDITION_NONE, bootstrap=400).verdict())
+
+    total = sum(u.cost_usd for u in usage_by_condition.values())
+    print(f"\ntotal cost: ${total:.4f}")
+    (outdir / "config.json").write_text(
+        json.dumps(
+            {"model": model, "conditions": conditions, "depth": args.depth,
+             "budget_tokens": matrix.budget_tokens, "tolerance": args.tolerance,
+             "tasks": len(tasks), "matrix": matrix.as_dict()},
+            indent=2, default=str,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
